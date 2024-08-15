@@ -12,6 +12,7 @@ Usage: python photo_reidentification_tool.py [list of directories] [list of code
 
 import sys
 import os
+from itertools import cycle
 import glob
 from typing import List, Dict
 import logging
@@ -20,8 +21,8 @@ import cv2
 import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QSlider, QPushButton, QComboBox, QFileDialog, QTextEdit,
-                             QLineEdit, QMessageBox)
-from PyQt6.QtGui import QImage, QPixmap, QTransform, QPainter, QWheelEvent, QMouseEvent
+                             QLineEdit, QMessageBox, QCheckBox)
+from PyQt6.QtGui import QImage, QPixmap, QTransform, QPainter, QWheelEvent, QMouseEvent, QPen, QAction
 from PyQt6.QtCore import Qt, QPointF, QDir
 import pandas as pd
 
@@ -66,23 +67,39 @@ class ComparisonLogger:
         self.columns = ['DATE', 'TIME', 'ID_A', 'ID_B', 'ARE_SAME', 'FULL_PATH_A', 'FULL_PATH_B',
                         'ROTATION_A', 'BRIGHTNESS_A', 'CONTRAST_A', 'RED_SHIFT_A',
                         'ROTATION_B', 'BRIGHTNESS_B', 'CONTRAST_B', 'RED_SHIFT_B',
+                        'ZOOM_A', 'PAN_X_A', 'PAN_Y_A', 'ZOOM_B', 'PAN_X_B', 'PAN_Y_B',
                         'NOTES', 'USER']
+        self.numeric_columns = ['ROTATION_A', 'BRIGHTNESS_A', 'CONTRAST_A', 'RED_SHIFT_A',
+                                'ROTATION_B', 'BRIGHTNESS_B', 'CONTRAST_B', 'RED_SHIFT_B',
+                                'ZOOM_A', 'PAN_X_A', 'PAN_Y_A', 'ZOOM_B', 'PAN_X_B', 'PAN_Y_B']
+        self.string_columns = ['ID_A', 'ID_B', 'ARE_SAME', 'FULL_PATH_A', 'FULL_PATH_B', 'NOTES', 'USER']
+        self.make_comparison_dir()
+        self.create_csv_if_not_exists()
+
+    def make_comparison_dir(self):
+        base_dir = os.path.dirname(self.csv_path)
+        comparison_dir = os.path.join(base_dir, 'pair_comparisons')
+        os.makedirs(comparison_dir, exist_ok=True)
+        for status in ['same', 'different', 'maybe']:
+            status_dir = os.path.join(comparison_dir, status)
+            os.makedirs(status_dir, exist_ok=True)
+
+    def create_csv_if_not_exists(self):
+        if not os.path.exists(self.csv_path):
+            df = pd.DataFrame(columns=self.columns)
+            df.to_csv(self.csv_path, index=False)
+            logging.info(f"Created new comparison results CSV at {self.csv_path}")
 
     def log_comparison(self, id_a, id_b, are_same, full_path_a, full_path_b,
                        rotation_a, brightness_a, contrast_a, color_correction_a,
                        rotation_b, brightness_b, contrast_b, color_correction_b,
-                       notes, user):
+                       notes, user, view_settings_a, view_settings_b):
         try:
-            print(f"Logging comparison: {id_a} vs {id_b}, status={are_same}, user={user}")
+            logging.info(f"Logging comparison: {id_a} vs {id_b}, status={are_same}, user={user}")
 
             current_datetime = datetime.now()
             current_date = current_datetime.strftime('%d-%m-%Y')
             current_time = current_datetime.strftime('%H-%M-%S')
-
-            try:
-                df = pd.read_csv(self.csv_path)
-            except FileNotFoundError:
-                df = pd.DataFrame(columns=self.columns)
 
             new_data = {
                 'DATE': current_date,
@@ -100,13 +117,36 @@ class ComparisonLogger:
                 'BRIGHTNESS_B': brightness_b,
                 'CONTRAST_B': contrast_b,
                 'RED_SHIFT_B': color_correction_b,
+                'ZOOM_A': view_settings_a['zoom'],
+                'PAN_X_A': view_settings_a['pan_x'],
+                'PAN_Y_A': view_settings_a['pan_y'],
+                'ZOOM_B': view_settings_b['zoom'],
+                'PAN_X_B': view_settings_b['pan_x'],
+                'PAN_Y_B': view_settings_b['pan_y'],
                 'NOTES': notes,
                 'USER': user
             }
 
-            print(f"Debug: Selecting row with ID_A={id_a}, ID_B={id_b}, USER={user}")
+            # Ensure numeric columns are float
+            for col in self.numeric_columns:
+                new_data[col] = pd.to_numeric(new_data[col], errors='coerce')
+
+            # Ensure string columns are str
+            for col in self.string_columns:
+                new_data[col] = str(new_data[col])
+
+            try:
+                df = pd.read_csv(self.csv_path)
+                for col in self.numeric_columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                for col in self.string_columns:
+                    df[col] = df[col].astype(str)
+            except FileNotFoundError:
+                df = pd.DataFrame(columns=self.columns)
+
+            logging.debug(f"Selecting row with ID_A={id_a}, ID_B={id_b}, USER={user}")
             mask = (df['ID_A'] == id_a) & (df['ID_B'] == id_b) & (df['USER'] == user)
-            print(f"Debug: Number of rows selected: {mask.sum()}")
+            logging.debug(f"Number of rows selected: {mask.sum()}")
 
             if mask.sum() == 0:
                 # No matching row, append new row
@@ -114,19 +154,111 @@ class ComparisonLogger:
             elif mask.sum() == 1:
                 # One matching row, update it
                 for column, value in new_data.items():
-                    df.loc[mask, column] = value
+                    if column in self.numeric_columns:
+                        df.loc[mask, column] = pd.to_numeric(value, errors='coerce')
+                    else:
+                        df.loc[mask, column] = value
             else:
                 # Multiple matching rows, this shouldn't happen
                 raise ValueError(
                     f"Multiple rows ({mask.sum()}) found for ID_A={id_a}, ID_B={id_b}, USER={user}. This indicates a data integrity issue.")
 
-            df['ARE_SAME'] = df['ARE_SAME'].fillna('')
+            # Ensure all columns are present
+            for col in self.columns:
+                if col not in df.columns:
+                    df[col] = np.nan
+
+            # Reorder columns to match self.columns
+            df = df[self.columns]
 
             df.to_csv(self.csv_path, index=False)
-            print(f"Comparison logged successfully")
+            logging.info(f"Comparison logged successfully")
         except Exception as e:
-            print(f"Error logging comparison: {str(e)}")
             logging.error(f"Error logging comparison: {str(e)}", exc_info=True)
+            raise  # Re-raise the exception after logging
+
+    def get_last_logged_comparison(self, id_a, id_b):
+        try:
+            # Load the CSV file
+            df = pd.read_csv(self.csv_path)
+
+            # Filter for entries matching either ID_A vs ID_B or ID_B vs ID_A
+            mask = ((df['ID_A'] == id_a) & (df['ID_B'] == id_b)) | ((df['ID_A'] == id_b) & (df['ID_B'] == id_a))
+
+            # Apply the mask to get the relevant entries
+            relevant_entries = df[mask]
+
+            if relevant_entries.empty:
+                # If no entries are found, return None or appropriate default value
+                return None
+
+            # Convert DATE and TIME columns to a datetime object for sorting
+            relevant_entries['DATETIME'] = pd.to_datetime(relevant_entries['DATE'] + ' ' + relevant_entries['TIME'],
+                                                          format='%d-%m-%Y %H-%M-%S')
+
+            # Sort by the DATETIME column in ascending order
+            relevant_entries = relevant_entries.sort_values(by='DATETIME')
+
+            # The last entry is the most recent
+            last_entry = relevant_entries.iloc[-1]
+
+            # Return the last entry as a dictionary or a pandas Series
+            return last_entry.to_dict()
+
+        except FileNotFoundError:
+            # Handle the case where the CSV file does not exist
+            logging.error("Comparison log file not found.")
+            return None
+
+        except Exception as e:
+            # General exception handling
+            logging.error(f"Error retrieving last logged comparison: {str(e)}", exc_info=True)
+            return None
+
+    def get_all_comparisons_with_settings(self, id_a, id_b):
+        # Similar to get_all_comparisons, but include image settings
+        try:
+            df = pd.read_csv(self.csv_path)
+            mask = ((df['ID_A'] == id_a) & (df['ID_B'] == id_b)) | ((df['ID_A'] == id_b) & (df['ID_B'] == id_a))
+            relevant_entries = df[mask].copy()
+
+            if relevant_entries.empty:
+                return []
+
+            relevant_entries['DATETIME'] = pd.to_datetime(relevant_entries['DATE'] + ' ' + relevant_entries['TIME'],
+                                                          format='%d-%m-%Y %H-%M-%S')
+            relevant_entries = relevant_entries.sort_values(by='DATETIME', ascending=False)
+
+            return [(row['ARE_SAME'], row['USER'], row['DATETIME'].strftime('%Y-%m-%d %H:%M:%S'),
+                     {'rotation_a': row['ROTATION_A'], 'brightness_a': row['BRIGHTNESS_A'],
+                      'contrast_a': row['CONTRAST_A'], 'red_shift_a': row['RED_SHIFT_A'],
+                      'zoom_a': row['ZOOM_A'], 'pan_x_a': row['PAN_X_A'], 'pan_y_a': row['PAN_Y_A'],
+                      'rotation_b': row['ROTATION_B'], 'brightness_b': row['BRIGHTNESS_B'],
+                      'contrast_b': row['CONTRAST_B'], 'red_shift_b': row['RED_SHIFT_B'],
+                      'zoom_b': row['ZOOM_B'], 'pan_x_b': row['PAN_X_B'], 'pan_y_b': row['PAN_Y_B']})
+                    for _, row in relevant_entries.iterrows()]
+        except Exception as e:
+            logging.error(f"Error retrieving comparisons with settings: {str(e)}", exc_info=True)
+            return []
+
+    def get_all_comparisons(self, id_a, id_b):
+        try:
+            df = pd.read_csv(self.csv_path)
+            mask = ((df['ID_A'] == id_a) & (df['ID_B'] == id_b)) | ((df['ID_A'] == id_b) & (df['ID_B'] == id_a))
+            relevant_entries = df[mask].copy()  # Create an explicit copy
+
+            if relevant_entries.empty:
+                return []
+
+            relevant_entries['DATETIME'] = pd.to_datetime(relevant_entries['DATE'] + ' ' + relevant_entries['TIME'],
+                                                          format='%d-%m-%Y %H-%M-%S')
+            relevant_entries = relevant_entries.sort_values(by='DATETIME', ascending=False)
+
+            return [(row['ARE_SAME'], row['USER'], row['DATETIME'].strftime('%Y-%m-%d %H:%M:%S'))
+                    for _, row in relevant_entries.iterrows()]
+        except Exception as e:
+            logging.error(f"Error retrieving comparisons: {str(e)}", exc_info=True)
+            return []
 
 class ImagePanel(QWidget):
     def __init__(self, parent=None):
@@ -138,12 +270,13 @@ class ImagePanel(QWidget):
         self.rotation_angle = 0
         self.last_pan_pos = None
         self.color_corrector = None
+        self.show_crosshair = False
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout()
 
-        # Create a fixed-size widget to contain the image label
+        # Image container (no changes here)
         self.image_container = QWidget()
         self.image_container.setFixedSize(800, 800)
         self.image_container_layout = QVBoxLayout(self.image_container)
@@ -155,45 +288,36 @@ class ImagePanel(QWidget):
 
         layout.addWidget(self.image_container)
 
-        # Brightness slider
-        brightness_layout = QHBoxLayout()
-        brightness_layout.addWidget(QLabel("Brightness:"))
-        self.brightness = QSlider(Qt.Orientation.Horizontal)
+        # Sliders (updated here)
+        for name, label_text in [("brightness", "Brightness:"),
+                                 ("contrast", "Contrast:"),
+                                 ("rotation", "Rotation:"),
+                                 ("color_correction_slider", "Red Shift:")]:
+            slider_layout = QHBoxLayout()
+            slider_layout.addWidget(QLabel(label_text))
+            slider = QSlider(Qt.Orientation.Horizontal)
+            setattr(self, name, slider)
+            slider_layout.addWidget(slider)
+            layout.addLayout(slider_layout)
+
+        # Set slider ranges and default values
         self.brightness.setRange(-100, 100)
-        self.brightness.setValue(0)
-        brightness_layout.addWidget(self.brightness)
-        layout.addLayout(brightness_layout)
-
-        # Contrast slider
-        contrast_layout = QHBoxLayout()
-        contrast_layout.addWidget(QLabel("Contrast:"))
-        self.contrast = QSlider(Qt.Orientation.Horizontal)
         self.contrast.setRange(0, 200)
-        self.contrast.setValue(100)
-        contrast_layout.addWidget(self.contrast)
-        layout.addLayout(contrast_layout)
-
-        # Rotation slider
-        rotation_layout = QHBoxLayout()
-        rotation_layout.addWidget(QLabel("Rotation:"))
-        self.rotation = QSlider(Qt.Orientation.Horizontal)
         self.rotation.setRange(-180, 180)
-        self.rotation.setValue(0)
-        rotation_layout.addWidget(self.rotation)
-        layout.addLayout(rotation_layout)
-
-        # Red Shift slider
-        color_correction_layout = QHBoxLayout()
-        color_correction_layout.addWidget(QLabel("Red Shift:"))
-        self.color_correction_slider = QSlider(Qt.Orientation.Horizontal)
         self.color_correction_slider.setRange(-100, 100)
+
+        self.brightness.setValue(0)
+        self.contrast.setValue(100)
+        self.rotation.setValue(0)
         self.color_correction_slider.setValue(0)
-        color_correction_layout.addWidget(self.color_correction_slider)
-        layout.addLayout(color_correction_layout)
 
         # Reset button
         self.reset_button = QPushButton("Reset Image")
         layout.addWidget(self.reset_button)
+
+        # Crosshair toggle
+        self.crosshair_toggle = QCheckBox("Show Crosshair")
+        layout.addWidget(self.crosshair_toggle)
 
         self.setLayout(layout)
 
@@ -203,6 +327,7 @@ class ImagePanel(QWidget):
         self.rotation.valueChanged.connect(self.update_image)
         self.color_correction_slider.valueChanged.connect(self.update_image)
         self.reset_button.clicked.connect(self.reset_image)
+        self.crosshair_toggle.stateChanged.connect(self.toggle_crosshair)
 
         # Enable mouse tracking
         self.setMouseTracking(True)
@@ -275,6 +400,7 @@ class ImagePanel(QWidget):
         painter.end()
 
         self.image_label.setPixmap(base_pixmap)
+        self.update_crosshair()
 
     def apply_transformations(self, image):
         # Apply brightness and contrast
@@ -291,7 +417,7 @@ class ImagePanel(QWidget):
             self.brightness.setValue(0)
             self.contrast.setValue(100)
             self.rotation.setValue(0)
-            self.color_correction_slider.setValue(0)  # Reset color correction
+            self.color_correction_slider.setValue(0)
             self.update_image()
 
     def wheelEvent(self, event: QWheelEvent):
@@ -321,15 +447,215 @@ class ImagePanel(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
             self.last_pan_pos = None
+
+    def toggle_crosshair(self, state):
+        print(f'Crosshair toggle called with state: {state}')
+        self.show_crosshair = (state == Qt.CheckState.Checked.value)
+        print(f'Crosshair toggled: {self.show_crosshair}')
+        self.update_image()
+
+    def update_crosshair(self):
+        if self.image_label.pixmap():
+            pixmap = self.image_label.pixmap().copy()
+            if self.show_crosshair:
+                painter = QPainter(pixmap)
+                painter.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.SolidLine))
+
+                # Define hatch properties
+                hatch_length = 10  # Length of hatches in pixels
+                hatch_spacing = 40  # Spacing between hatches in pixels
+
+                # Draw vertical line
+                center_x = pixmap.width() // 2
+                center_y = pixmap.height() // 2
+                painter.drawLine(center_x, 0, center_x, pixmap.height())
+
+                # Draw horizontal line
+                painter.drawLine(0, center_y, pixmap.width(), center_y)
+
+                # Add hatches along the vertical line
+                for i in range(0, pixmap.height(), hatch_spacing):
+                    painter.drawLine(center_x - hatch_length // 2, i, center_x + hatch_length // 2, i)
+
+                # Add hatches along the horizontal line
+                for i in range(0, pixmap.width(), hatch_spacing):
+                    painter.drawLine(i, center_y - hatch_length // 2, i, center_y + hatch_length // 2)
+
+                painter.end()
+
+            self.image_label.setPixmap(pixmap)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.show_crosshair:
+            painter = QPainter(self.image_container)
+            painter.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.SolidLine))
+
+            # Define hatch properties
+            hatch_length = 10  # Length of hatches in pixels
+            hatch_spacing = 40  # Spacing between hatches in pixels
+
+            # Draw vertical line with hatches
+            center_x = self.image_container.width() // 2
+            center_y = self.image_container.height() // 2
+            painter.drawLine(center_x, 0, center_x, self.image_container.height())
+
+            for i in range(0, self.image_container.height(), hatch_spacing):
+                painter.drawLine(center_x - hatch_length // 2, i, center_x + hatch_length // 2, i)
+
+            # Draw horizontal line with hatches
+            painter.drawLine(0, center_y, self.image_container.width(), center_y)
+
+            for i in range(0, self.image_container.width(), hatch_spacing):
+                painter.drawLine(i, center_y - hatch_length // 2, i, center_y + hatch_length // 2)
+
+            painter.end()
+
+    def get_view_settings(self):
+        return {
+            'zoom': self.zoom_factor,
+            'pan_x': self.pan_offset.x(),
+            'pan_y': self.pan_offset.y()
+        }
+
+    def save_current_view(self, save_path):
+        if self.image_label.pixmap():
+            ## if crosshair is shown, turn it off then save
+            crosshair_state = self.show_crosshair
+            if crosshair_state:
+                self.show_crosshair = False
+                self.update_image()
+
+            pixmap = self.image_label.pixmap()
+            pixmap.save(save_path, 'PNG')
+            logging.info(f"Saved current view to {save_path}")
+
+            ## turn crosshair back on if it was on
+            if crosshair_state:
+                self.show_crosshair = True
+                self.update_image()
+
+        else:
+            logging.warning("No image to save")
+
+    def apply_settings(self, settings):
+        self.zoom_factor = settings['zoom']
+        self.pan_offset = QPointF(settings['pan_x'], settings['pan_y'])
+        self.rotation.setValue(settings['rotation'])
+        self.brightness.setValue(settings['brightness'])
+        self.contrast.setValue(settings['contrast'])
+        self.color_correction_slider.setValue(settings['red_shift'])
+        self.update_image()
+
 class MainWindow(QMainWindow):
-    def __init__(self, directories: List[str], codes: List[str]):
+    def __init__(self):
         super().__init__()
-        self.directories = directories
-        self.codes = codes
+        self.directories = []
+        self.codes = []
+        self.comparison_logger = None  # Initialize with None
         self.current_images = {"A": [], "B": []}
         self.current_indices = {"A": 0, "B": 0}
-        self.comparison_logger = ComparisonLogger(get_src_data_dir())
         self.init_ui()
+        self.init_menu()
+
+    def init_menu(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu('File')
+
+        select_action = QAction('Select root folder', self)
+        select_action.triggered.connect(self.select_root_folder)
+        file_menu.addAction(select_action)
+
+    def disable_ui_elements(self):
+        self.dir_combo_a.setEnabled(False)
+        self.dir_combo_b.setEnabled(False)
+        self.prev_button_a.setEnabled(False)
+        self.next_button_a.setEnabled(False)
+        self.prev_button_b.setEnabled(False)
+        self.next_button_b.setEnabled(False)
+        self.same_button.setEnabled(False)
+        self.maybe_button.setEnabled(False)
+        self.diff_button.setEnabled(False)
+
+    def enable_ui_elements(self):
+        self.dir_combo_a.setEnabled(True)
+        self.dir_combo_b.setEnabled(True)
+        self.prev_button_a.setEnabled(True)
+        self.next_button_a.setEnabled(True)
+        self.prev_button_b.setEnabled(True)
+        self.next_button_b.setEnabled(True)
+        self.same_button.setEnabled(True)
+        self.maybe_button.setEnabled(True)
+        self.diff_button.setEnabled(True)
+
+    def select_root_folder(self):
+        try:
+            root_dir = QFileDialog.getExistingDirectory(self, "Select Root Folder")
+            if root_dir:
+                logging.info(f"Selected root directory: {root_dir}")
+                self.load_directories(root_dir)
+        except Exception as e:
+            logging.error(f"Error in select_root_folder: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"An error occurred while selecting the root folder: {str(e)}")
+
+    def load_directories(self, root_dir):
+        try:
+            logging.info("Starting to load directories")
+            image_directories = glob.glob(os.path.join(root_dir, '*', '*'))
+            image_directories = [d for d in image_directories if os.path.isdir(d) and 'pair_comparisons' not in d]
+
+            if not image_directories:
+                raise ValueError("No valid image directories found")
+
+            self.directories = image_directories
+            self.codes = [os.path.basename(d) + '__' + os.path.basename(os.path.dirname(d)) for d in image_directories]
+
+            logging.info(f"Found {len(self.directories)} directories")
+
+            # Initialize ComparisonLogger before updating directory combos
+            self.comparison_logger = ComparisonLogger(root_dir)
+            logging.info("ComparisonLogger initialized")
+
+            self.update_directory_combos()
+            self.enable_ui_elements()
+            logging.info("Directories loaded successfully")
+        except Exception as e:
+            logging.error(f"Error in load_directories: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"An error occurred while loading directories: {str(e)}")
+
+    def update_directory_combos(self):
+        try:
+            logging.info("Updating directory combos")
+            self.dir_combo_a.clear()
+            self.dir_combo_b.clear()
+            self.dir_combo_a.addItems(self.codes)
+            self.dir_combo_b.addItems(self.codes)
+            if self.directories:
+                self.load_directory("A")
+                self.load_directory("B")
+            logging.info("Directory combos updated successfully")
+        except Exception as e:
+            logging.error(f"Error in update_directory_combos: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"An error occurred while updating directory combos: {str(e)}")
+
+    def load_directory(self, panel: str):
+        try:
+            if self.directories:
+                logging.info(f"Loading directory for panel {panel}")
+                index = self.dir_combo_a.currentIndex() if panel == "A" else self.dir_combo_b.currentIndex()
+                directory = self.directories[index]
+                self.current_images[panel] = [os.path.join(directory, f) for f in os.listdir(directory) if
+                                              f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                self.current_indices[panel] = 0
+                if self.current_images[panel]:
+                    self.load_image(panel)
+                else:
+                    logging.warning(f"No images found in directory: {directory}")
+                    getattr(self, f"panel_{panel.lower()}").image_label.setText("No images found")
+                logging.info(f"Directory loaded for panel {panel}")
+        except Exception as e:
+            logging.error(f"Error in load_directory: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"An error occurred while loading directory for panel {panel}: {str(e)}")
 
     def init_ui(self):
         central_widget = QWidget()
@@ -337,13 +663,13 @@ class MainWindow(QMainWindow):
 
         # Left panel
         left_panel = QVBoxLayout()
-        self.panel_a = ImagePanel()
+        self.panel_a = ImagePanel(self)
         self.dir_combo_a = QComboBox()
         self.dir_combo_a.addItems(self.codes)
         left_panel.addWidget(self.dir_combo_a)
         left_panel.addWidget(self.panel_a)
 
-        # Create horizontal layout for navigation buttons A
+        # Navigation buttons A
         nav_buttons_layout_a = QHBoxLayout()
         self.prev_button_a = QPushButton("Previous Image A")
         self.next_button_a = QPushButton("Next Image A")
@@ -355,13 +681,13 @@ class MainWindow(QMainWindow):
 
         # Right panel
         right_panel = QVBoxLayout()
-        self.panel_b = ImagePanel()
+        self.panel_b = ImagePanel(self)
         self.dir_combo_b = QComboBox()
         self.dir_combo_b.addItems(self.codes)
         right_panel.addWidget(self.dir_combo_b)
         right_panel.addWidget(self.panel_b)
 
-        # Create horizontal layout for navigation buttons B
+        # Navigation buttons B
         nav_buttons_layout_b = QHBoxLayout()
         self.prev_button_b = QPushButton("Previous Image B")
         self.next_button_b = QPushButton("Next Image B")
@@ -380,21 +706,43 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.maybe_button)
         control_layout.addWidget(self.diff_button)
 
-        # Add user input field
+        # User input field
         user_layout = QHBoxLayout()
         user_layout.addWidget(QLabel("User:"))
         self.user_field = QLineEdit()
         self.user_field.setPlaceholderText("Initials")
-        self.user_field.setMaxLength(3)  # Limit to 3 characters for initials
-        self.user_field.setFixedWidth(100)  # Set a fixed width to match button size
+        self.user_field.setMaxLength(10)
+        self.user_field.setFixedWidth(100)
         user_layout.addWidget(self.user_field)
         control_layout.addLayout(user_layout)
 
-        # Add notes field
+        # Notes field
         self.notes_field = QTextEdit()
         self.notes_field.setPlaceholderText("Enter notes about the comparison here...")
         control_layout.addWidget(QLabel("Notes:"))
         control_layout.addWidget(self.notes_field)
+
+        # Add new widget for past matches
+        self.past_matches_field = QTextEdit()
+        self.past_matches_field.setReadOnly(True)
+        self.past_matches_field.setPlaceholderText("No past matches found...")
+        control_layout.addWidget(QLabel("Past Matches:"))
+        control_layout.addWidget(self.past_matches_field)
+
+        # Add crosshair toggles to the control layout
+        control_layout.addWidget(QLabel("Crosshair Controls:"))
+        control_layout.addWidget(self.panel_a.crosshair_toggle)
+        control_layout.addWidget(self.panel_b.crosshair_toggle)
+
+        self.cycle_perspectives_button = QPushButton("Cycle Past Perspectives")
+        control_layout.addWidget(self.cycle_perspectives_button)
+
+        # Add the new Reset Perspective button
+        self.reset_perspective_button = QPushButton("Reset Perspective")
+        control_layout.addWidget(self.reset_perspective_button)
+
+        self.past_perspectives = []
+        self.perspective_cycle = None
 
         main_layout.addLayout(control_layout)
 
@@ -411,10 +759,11 @@ class MainWindow(QMainWindow):
         self.same_button.clicked.connect(lambda: self.compare_images('same'))
         self.diff_button.clicked.connect(lambda: self.compare_images('different'))
         self.maybe_button.clicked.connect(lambda: self.compare_images('maybe'))
+        self.cycle_perspectives_button.clicked.connect(self.cycle_past_perspectives)
+        self.reset_perspective_button.clicked.connect(self.reset_perspective)
 
-        # Load initial images
-        self.load_directory("A")
-        self.load_directory("B")
+        # Disable UI elements initially
+        self.disable_ui_elements()
 
     def load_directory(self, panel: str):
         index = self.dir_combo_a.currentIndex() if panel == "A" else self.dir_combo_b.currentIndex()
@@ -429,11 +778,63 @@ class MainWindow(QMainWindow):
             getattr(self, f"panel_{panel.lower()}").image_label.setText("No images found")
 
     def load_image(self, panel: str):
-        if self.current_images[panel]:
-            image_path = self.current_images[panel][self.current_indices[panel]]
-            getattr(self, f"panel_{panel.lower()}").load_image(image_path)
-        else:
-            logging.warning(f"No images available for panel {panel}")
+        try:
+            if self.current_images[panel]:
+                logging.info(f"Loading image for panel {panel}")
+                image_path = self.current_images[panel][self.current_indices[panel]]
+                getattr(self, f"panel_{panel.lower()}").load_image(image_path)
+                if self.comparison_logger:  # Only update past matches if comparison_logger is initialized
+                    self.update_past_matches()
+                logging.info(f"Image loaded for panel {panel}")
+            else:
+                logging.warning(f"No images available for panel {panel}")
+        except Exception as e:
+            logging.error(f"Error in load_image: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"An error occurred while loading image for panel {panel}: {str(e)}")
+
+    def update_past_matches(self):
+        try:
+            if self.comparison_logger is None:
+                logging.warning("ComparisonLogger is not initialized")
+                return
+
+            id_a = self.codes[self.dir_combo_a.currentIndex()]
+            id_b = self.codes[self.dir_combo_b.currentIndex()]
+            self.past_perspectives = self.comparison_logger.get_all_comparisons_with_settings(id_a, id_b)
+
+            if self.past_perspectives:
+                text = "\n".join(f"({match}, {user}, {datetime})" for match, user, datetime, _ in self.past_perspectives)
+                self.perspective_cycle = cycle(self.past_perspectives)
+            else:
+                text = "No past matches found."
+                self.perspective_cycle = None
+
+            self.past_matches_field.setText(text)
+        except Exception as e:
+            logging.error(f"Error in update_past_matches: {str(e)}", exc_info=True)
+            QMessageBox.warning(self, "Warning", f"An error occurred while updating past matches: {str(e)}")
+
+    def cycle_past_perspectives(self):
+        if not self.perspective_cycle:
+            QMessageBox.information(self, "No Past Perspectives", "There are no past perspectives to cycle through.")
+            return
+
+        match, user, datetime, settings = next(self.perspective_cycle)
+        self.panel_a.apply_settings({k[:-2]: v for k, v in settings.items() if k.endswith('_a')})
+        self.panel_b.apply_settings({k[:-2]: v for k, v in settings.items() if k.endswith('_b')})
+
+        QMessageBox.information(self, "Past Perspective Applied", f"Applied perspective from {user} on {datetime}")
+
+    def reset_perspective(self):
+        # Reset both image panels
+        self.panel_a.reset_image()
+        self.panel_b.reset_image()
+
+        # Reset any MainWindow state related to perspectives
+        self.perspective_cycle = None
+
+        # Optionally, update the UI to reflect the reset state
+        self.update_past_matches()
 
     def next_image(self, panel: str):
         self.change_image(panel, 1)
@@ -445,6 +846,19 @@ class MainWindow(QMainWindow):
         if self.current_images[panel]:
             self.current_indices[panel] = (self.current_indices[panel] + step) % len(self.current_images[panel])
             self.load_image(panel)
+
+    def save_comparison_images(self, status, id_a, id_b):
+        base_dir = os.path.dirname(self.comparison_logger.csv_path)
+        comparison_dir = os.path.join(base_dir, 'pair_comparisons', status, f'{id_a}_vs_{id_b}')
+        os.makedirs(comparison_dir, exist_ok=True)
+
+        image_a_path = os.path.join(comparison_dir, f'A__{id_a}.png')
+        image_b_path = os.path.join(comparison_dir, f'B__{id_b}.png')
+
+        self.panel_a.save_current_view(image_a_path)
+        self.panel_b.save_current_view(image_b_path)
+
+        logging.info(f"Saved comparison images to {comparison_dir}")
 
     def compare_images(self, status: str):
         try:
@@ -458,6 +872,9 @@ class MainWindow(QMainWindow):
             notes = self.notes_field.toPlainText()
             user = self.user_field.text()
 
+            view_settings_a = self.panel_a.get_view_settings()
+            view_settings_b = self.panel_b.get_view_settings()
+
             if not user:
                 QMessageBox.warning(self, "Missing User", "Please enter your initials before comparing images.")
                 return
@@ -466,11 +883,19 @@ class MainWindow(QMainWindow):
                 id_a, id_b, status, full_path_a, full_path_b,
                 self.panel_a.rotation.value(), self.panel_a.brightness.value(), self.panel_a.contrast.value(),
                 self.panel_a.color_correction_slider.value(),
+                # Changed from color_correction to color_correction_slider
                 self.panel_b.rotation.value(), self.panel_b.brightness.value(), self.panel_b.contrast.value(),
                 self.panel_b.color_correction_slider.value(),
+                # Changed from color_correction to color_correction_slider
                 notes,
-                user  # Add user to the log_comparison call
+                user,
+                view_settings_a,
+                view_settings_b
             )
+            self.update_past_matches()  # Update past matches after new comparison
+
+            # Save comparison images
+            self.save_comparison_images(status, id_a, id_b)
 
         except Exception as e:
             print(f"Error in compare_images: {str(e)}")
@@ -500,21 +925,10 @@ def get_src_data_dir():
     return os.path.join('..', 'archive', 'cropped_sequence_sorted')
 
 
-def main(image_directories=None, codes=None):
-    src_data_dir = get_src_data_dir()
-
-    if image_directories is None:
-        image_directories = glob.glob(os.path.join(src_data_dir, '*', '*'))
-        image_directories = [d for d in image_directories if os.path.isdir(d)]
-
-    if codes is None:
-        codes = [os.path.basename(d) + '__' + os.path.basename(os.path.dirname(d)) for d in image_directories]
-
-    for c, d in zip(codes, image_directories):
-        print(f"Code: {c}, Directory: {d}")
-
+def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     app = QApplication(sys.argv)
-    window = MainWindow(image_directories, codes)
+    window = MainWindow()
     window.show()
     sys.exit(app.exec())
 
